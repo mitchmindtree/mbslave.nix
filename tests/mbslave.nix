@@ -45,6 +45,8 @@
         for table in ["artist", "release_group", "recording", "isrc", "replication_control"]:
             owner = mb(f"SELECT tableowner FROM pg_tables WHERE schemaname = 'musicbrainz' AND tablename = '{table}'")
             assert owner == "musicbrainz", f"{table}: {owner!r}"
+        search_path = mb("SHOW search_path")
+        assert search_path == "musicbrainz, public", search_path
 
     with subtest("only peer auth with the mbslave map admits other users"):
         machine.fail("sudo -u nobody psql -U musicbrainz -d musicbrainz -c 'SELECT 1'")

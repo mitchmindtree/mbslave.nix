@@ -71,8 +71,8 @@ in
 
     package = mkOption {
       type = types.package;
-      default = pkgs.callPackage ../pkgs/mbslave.nix { };
-      defaultText = lib.literalMD "mbslave from this flake";
+      default = pkgs.callPackage ../pkgs/mbslave.nix { postgresql = pg.package; };
+      defaultText = lib.literalMD "mbslave from this flake, with the psql of `services.postgresql.package`";
       description = "The mbslave package to use.";
     };
 
@@ -242,7 +242,7 @@ in
 
         # The replication triggers resolve unqualified names through the
         # search_path, which by default covers only a schema named after the role.
-        psql -d ${cfg.database} -c "ALTER ROLE ${cfg.user} SET search_path TO ${
+        psql -c "ALTER ROLE ${cfg.user} IN DATABASE ${cfg.database} SET search_path TO ${
           cfg.settings.schemas.musicbrainz or "musicbrainz"
         }, public"
 

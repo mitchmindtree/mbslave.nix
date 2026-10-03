@@ -412,11 +412,12 @@ in
     };
 
     # The point from which the mirror is imported and readable. Units that use
-    # the mirror order on it rather than on mbslave-init, which reports success
-    # as soon as a first import starts:
+    # the mirror hang off it rather than off mbslave-init, which reports
+    # success as soon as a first import starts. A target is ordered after the
+    # units it wants, so they order on mbslave-grants, not on the target:
     #
     #   wantedBy = [ "mbslave-ready.target" ];
-    #   after = [ "mbslave-ready.target" ];
+    #   after = [ "mbslave-grants.service" ];
     systemd.targets.mbslave-ready = {
       description = "MusicBrainz mirror imported and readable";
       wants = [ "mbslave-grants.service" ];
@@ -439,7 +440,7 @@ in
       requires = [ "postgresql.target" ];
       after = [
         "postgresql.target"
-        "mbslave-ready.target"
+        "mbslave-grants.service"
       ];
       unitConfig.ConditionPathExists = [
         stamp

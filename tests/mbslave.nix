@@ -3,7 +3,7 @@
 let
   consumer = {
     wantedBy = [ "mbslave-ready.target" ];
-    after = [ "mbslave-ready.target" ];
+    after = [ "mbslave-grants.service" ];
     serviceConfig = {
       Type = "oneshot";
       RemainAfterExit = true;
@@ -81,6 +81,7 @@ in
         imported = int(machine.succeed("systemctl show -P ExecMainExitTimestampMonotonic mbslave-init"))
         started = int(machine.succeed("systemctl show -P ExecMainStartTimestampMonotonic consumer"))
         assert started > imported, f"consumer started at {started}, import ended at {imported}"
+        machine.fail("journalctl -b | grep -q 'ordering cycle'")
 
     with subtest("the materialized tables are built once after the import"):
         machine.wait_for_file("/var/lib/mbslave/materialized", timeout=600)

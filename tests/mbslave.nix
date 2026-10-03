@@ -82,6 +82,16 @@ in
         started = int(machine.succeed("systemctl show -P ExecMainStartTimestampMonotonic consumer"))
         assert started > imported, f"consumer started at {started}, import ended at {imported}"
 
+    with subtest("the materialized tables are built once after the import"):
+        machine.wait_for_file("/var/lib/mbslave/materialized", timeout=600)
+        machine.wait_until_succeeds("systemctl show -P ActiveState mbslave-materialize | grep -x inactive")
+        assert machine.succeed("systemctl show -P Result mbslave-materialize").strip() == "success"
+        inserts = machine.succeed("journalctl -u mbslave-materialize | grep -c 'INSERT 0 0'").strip()
+        assert inserts == "5", inserts
+        machine.succeed("systemctl start mbslave-materialize")
+        assert machine.succeed("systemctl show -P ConditionResult mbslave-materialize").strip() == "no"
+        assert "mbslave-materialize.service" in machine.succeed("systemctl show -P After mbslave-sync")
+
     with subtest("a switch starts units that a new configuration adds to the ready target"):
         machine.succeed("/run/booted-system/specialisation/lateconsumer/bin/switch-to-configuration test")
         machine.succeed("systemctl is-active late-consumer")
@@ -117,6 +127,15 @@ in
         assert machine.succeed("systemctl show -P Result mbslave-sync").strip() == "success"
         machine.succeed("journalctl -u packets | grep -F 'GET /replication-101-v2.tar.bz2?token=test-token'")
 
+    with subtest("sync waits while the materialized tables are rebuilt"):
+        machine.succeed("flock /run/mbslave sleep 6 >/dev/null 2>&1 &")
+        machine.succeed("sleep 1")
+        machine.succeed("systemctl start --no-block mbslave-sync")
+        machine.succeed("sleep 2")
+        assert machine.succeed("systemctl show -P ActiveState mbslave-sync").strip() == "activating"
+        machine.wait_until_succeeds("systemctl show -P ActiveState mbslave-sync | grep -x inactive", timeout=30)
+        assert machine.succeed("systemctl show -P Result mbslave-sync").strip() == "success"
+
     with subtest("init does not run again once the stamp exists"):
         machine.succeed("systemctl start mbslave-init")
         assert machine.succeed("systemctl show -P ConditionResult mbslave-init").strip() == "no"
@@ -127,6 +146,9 @@ in
         machine.wait_for_file("/var/lib/mbslave/initialised", timeout=600)
         assert mb("SELECT count(*) FROM musicbrainz.replication_control") == "0"
         machine.succeed(as_user("alice", "SELECT count(*) FROM musicbrainz.artist"))
+        machine.fail("test -e /var/lib/mbslave/materialized")
+        machine.succeed("systemctl start mbslave-materialize")
+        machine.wait_for_file("/var/lib/mbslave/materialized", timeout=120)
 
     with subtest("removing a reader revokes its access"):
         machine.succeed("/run/booted-system/specialisation/noreaders/bin/switch-to-configuration test")

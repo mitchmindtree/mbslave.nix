@@ -26,6 +26,51 @@ let
   stamp = "${cfg.stateDir}/initialised";
   marker = "${cfg.stateDir}/importing";
   dumps = "${cfg.stateDir}/dumps";
+  materializedStamp = "${cfg.stateDir}/materialized";
+  lockDir = "/run/mbslave";
+
+  mirrorSchema = cfg.settings.schemas.musicbrainz or "musicbrainz";
+
+  # The `all` run of admin/BuildMaterializedTables in musicbrainz-server, in
+  # its order and with its transactions. Upstream skips a table that is not
+  # empty, but replication fills the first release dates and area_containment
+  # in part before this runs, so every table is rebuilt.
+  materializeSql = pkgs.writeText "mbslave-materialize.sql" ''
+    SET ROLE ${cfg.user};
+    SET search_path TO ${mirrorSchema}, public;
+    SET statement_timeout = 0;
+
+    BEGIN;
+    ALTER TABLE release_first_release_date DISABLE TRIGGER apply_artist_release_pending_updates_mirror;
+    TRUNCATE release_first_release_date;
+    INSERT INTO release_first_release_date SELECT * FROM get_release_first_release_date_rows('TRUE');
+    ALTER TABLE release_first_release_date ENABLE TRIGGER apply_artist_release_pending_updates_mirror;
+    TRUNCATE artist_release_pending_update;
+    COMMIT;
+
+    BEGIN;
+    TRUNCATE recording_first_release_date;
+    INSERT INTO recording_first_release_date SELECT * FROM get_recording_first_release_date_rows('TRUE');
+    COMMIT;
+
+    BEGIN;
+    TRUNCATE artist_release;
+    INSERT INTO artist_release SELECT * FROM get_artist_release_rows(NULL);
+    COMMIT;
+
+    BEGIN;
+    TRUNCATE artist_release_group;
+    INSERT INTO artist_release_group SELECT * FROM get_artist_release_group_rows(NULL);
+    COMMIT;
+
+    BEGIN;
+    TRUNCATE area_containment;
+    INSERT INTO area_containment
+    SELECT DISTINCT ON (descendant, parent) descendant, parent, depth
+    FROM get_area_parent_hierarchy_rows(NULL)
+    ORDER BY descendant, parent, depth;
+    COMMIT;
+  '';
 
   # `public` belongs to pg_database_owner, and the pg_* and information_schema
   # schemas to the superuser, in every database.
@@ -165,6 +210,18 @@ in
       '';
     };
 
+    materializeTables = mkOption {
+      type = types.bool;
+      default = true;
+      description = ''
+        Whether to fill the materialized tables of MusicBrainz once the mirror
+        is imported: artist_release, artist_release_group, the first release
+        dates and area_containment. Triggers on the mirror keep them current
+        after that. On a full mirror the build takes a long time and much
+        temporary disk, and the sync waits for it.
+      '';
+    };
+
     tokenFile = mkOption {
       type = types.nullOr types.path;
       default = null;
@@ -257,10 +314,19 @@ in
     };
     users.groups.${cfg.user} = { };
 
-    systemd.tmpfiles.settings.mbslave.${cfg.stateDir}.d = {
-      user = pg.superUser;
-      group = pg.superUser;
-      mode = "0750";
+    systemd.tmpfiles.settings.mbslave = {
+      ${cfg.stateDir}.d = {
+        user = pg.superUser;
+        group = pg.superUser;
+        mode = "0750";
+      };
+      # mbslave-sync and mbslave-materialize lock this directory, so packets are
+      # never applied while the materialized tables are rebuilt.
+      ${lockDir}.d = {
+        user = cfg.user;
+        group = config.users.users.${pg.superUser}.group;
+        mode = "0750";
+      };
     };
 
     systemd.services.mbslave-init = {
@@ -306,6 +372,8 @@ in
           echo "Database ${cfg.database} exists but mbslave-init did not create it. Not importing over it." >&2
           exit 1
         fi
+        # A new database needs its materialized tables built again.
+        rm -f ${escapeShellArg materializedStamp}
         touch ${escapeShellArg marker}
 
         # mbslave downloads the dumps into the working directory.
@@ -318,9 +386,7 @@ in
 
         # The replication triggers resolve unqualified names through the
         # search_path, which by default covers only a schema named after the role.
-        psql -c "ALTER ROLE ${cfg.user} IN DATABASE ${cfg.database} SET search_path TO ${
-          cfg.settings.schemas.musicbrainz or "musicbrainz"
-        }, public"
+        psql -c "ALTER ROLE ${cfg.user} IN DATABASE ${cfg.database} SET search_path TO ${mirrorSchema}, public"
         ${applyGrants}
 
         mv ${escapeShellArg marker} ${escapeShellArg stamp}
@@ -367,6 +433,38 @@ in
       };
     };
 
+    systemd.services.mbslave-materialize = mkIf cfg.materializeTables {
+      description = "Fill the materialized tables of the MusicBrainz mirror";
+      wantedBy = [ "mbslave-ready.target" ];
+      requires = [ "postgresql.target" ];
+      after = [
+        "postgresql.target"
+        "mbslave-ready.target"
+      ];
+      unitConfig.ConditionPathExists = [
+        stamp
+        "!${materializedStamp}"
+      ];
+      # Like mbslave-init, the build takes long enough that Type=exec must keep
+      # it from holding up boot and `nixos-rebuild switch`, and a restart would
+      # kill it. To retry after a failure, start the unit again.
+      restartIfChanged = false;
+      path = [
+        pg.package
+        pkgs.util-linux
+      ];
+      serviceConfig = hardening // {
+        Type = "exec";
+        User = pg.superUser;
+        Group = pg.superUser;
+        ReadWritePaths = [ cfg.stateDir ];
+      };
+      script = ''
+        flock ${lockDir} psql -v ON_ERROR_STOP=1 -d ${cfg.database} -f ${materializeSql}
+        touch ${escapeShellArg materializedStamp}
+      '';
+    };
+
     systemd.services.mbslave-sync = mkIf (cfg.tokenFile != null) {
       description = "Apply MusicBrainz replication packets";
       requires = [ "postgresql.target" ];
@@ -374,7 +472,8 @@ in
       after = [
         "postgresql.target"
         "network-online.target"
-      ];
+      ]
+      ++ lib.optional cfg.materializeTables "mbslave-materialize.service";
       unitConfig.ConditionPathExists = stamp;
       startAt = cfg.syncStartAt;
       environment = environment // {
@@ -386,7 +485,7 @@ in
         Type = "oneshot";
         User = cfg.user;
         Group = cfg.user;
-        ExecStart = "${lib.getExe cfg.package} sync";
+        ExecStart = "${pkgs.util-linux}/bin/flock ${lockDir} ${lib.getExe cfg.package} sync";
         LoadCredential = "token:${cfg.tokenFile}";
       };
     };

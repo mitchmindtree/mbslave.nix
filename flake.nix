@@ -23,9 +23,15 @@
         };
       };
 
+      nixosModules.default = ./nixos/mbslave.nix;
+
       packages = perSystemPkgs (pkgs: {
         inherit (pkgs) mbslave;
         default = pkgs.mbslave;
+      });
+
+      checks = perSystemPkgs (pkgs: {
+        nixos = pkgs.testers.runNixOSTest ./tests/mbslave.nix;
       });
 
       devShells = perSystemPkgs (pkgs: { });

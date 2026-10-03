@@ -111,5 +111,18 @@
         machine.succeed("systemctl start mbslave-init")
         machine.wait_until_succeeds("systemctl show -P Result mbslave-init | grep -x exit-code")
         machine.succeed("journalctl -u mbslave-init | grep -F 'mbslave-init did not create it'")
+
+    with subtest("init never drops a database that holds another role's schema"):
+        machine.succeed(
+            "sudo -u postgres psql -d musicbrainz -c "
+            "'CREATE SCHEMA app AUTHORIZATION bob; "
+            "CREATE TABLE app.keep (id int); INSERT INTO app.keep VALUES (1)'"
+        )
+        machine.succeed("touch /var/lib/mbslave/importing")
+        machine.succeed("systemctl reset-failed mbslave-init")
+        machine.succeed("systemctl start mbslave-init")
+        machine.wait_until_succeeds("systemctl show -P Result mbslave-init | grep -x exit-code")
+        machine.succeed("journalctl -u mbslave-init | grep -F 'holds schemas that musicbrainz does not own: app.'")
+        assert machine.succeed("sudo -u postgres psql -d musicbrainz -tAc 'SELECT id FROM app.keep'").strip() == "1"
   '';
 }

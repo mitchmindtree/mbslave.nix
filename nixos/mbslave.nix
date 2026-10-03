@@ -27,6 +27,15 @@ let
   marker = "${cfg.stateDir}/importing";
   dumps = "${cfg.stateDir}/dumps";
 
+  # `public` belongs to pg_database_owner, and the pg_* and information_schema
+  # schemas to the superuser, in every database.
+  foreignSchemasSql = ''
+    SELECT string_agg(nspname, ', ' ORDER BY nspname) FROM pg_namespace
+    WHERE nspowner <> (SELECT oid FROM pg_roles WHERE rolname = '${cfg.user}')
+      AND nspname NOT LIKE 'pg\_%'
+      AND nspname NOT IN ('information_schema', 'public')
+  '';
+
   readerRole = "${cfg.user}_reader";
   quotedReaders = lib.concatMapStringsSep ", " (r: "'${r}'") cfg.readers;
 
@@ -282,7 +291,16 @@ in
       };
       script = ''
         if [ -e ${escapeShellArg marker} ]; then
-          # A run that did not finish left a partial database behind.
+          # A run that did not finish left a partial database behind. Other
+          # services may keep their own schemas in the mirror database, so never
+          # drop a database that holds a schema of another role.
+          if [ "$(psql -tAc "SELECT 1 FROM pg_database WHERE datname = '${cfg.database}'")" = 1 ]; then
+            foreign=$(psql -d ${cfg.database} -tAc "${foreignSchemasSql}")
+            if [ -n "$foreign" ]; then
+              echo "Database ${cfg.database} holds schemas that ${cfg.user} does not own: $foreign. Not dropping it to retry the import." >&2
+              exit 1
+            fi
+          fi
           dropdb --if-exists ${cfg.database}
         elif [ "$(psql -tAc "SELECT 1 FROM pg_database WHERE datname = '${cfg.database}'")" = 1 ]; then
           echo "Database ${cfg.database} exists but mbslave-init did not create it. Not importing over it." >&2

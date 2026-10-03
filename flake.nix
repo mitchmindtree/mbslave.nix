@@ -1,5 +1,5 @@
 {
-  description = "";
+  description = "mbslave packaged for Nix, with a NixOS module for a replicated MusicBrainz mirror";
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
@@ -19,11 +19,14 @@
     {
       overlays = {
         default = final: prev: {
-          # Declare packages here.
+          mbslave = final.callPackage ./pkgs/mbslave.nix { };
         };
       };
 
-      packages = perSystemPkgs (pkgs: { });
+      packages = perSystemPkgs (pkgs: {
+        inherit (pkgs) mbslave;
+        default = pkgs.mbslave;
+      });
 
       devShells = perSystemPkgs (pkgs: { });
 

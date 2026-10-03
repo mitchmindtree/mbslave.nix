@@ -1,5 +1,16 @@
 # Offline: the initial import creates the empty schema only, and a local HTTP
 # server stands in for the MetaBrainz packet server.
+let
+  consumer = {
+    wantedBy = [ "mbslave-ready.target" ];
+    after = [ "mbslave-ready.target" ];
+    serviceConfig = {
+      Type = "oneshot";
+      RemainAfterExit = true;
+    };
+    script = "test -e /var/lib/mbslave/initialised";
+  };
+in
 {
   name = "mbslave";
 
@@ -24,6 +35,11 @@
       services.postgresql.ensureUsers = [ { name = "bob"; } ];
 
       specialisation.noreaders.configuration.services.mbslave.readers = lib.mkForce [ ];
+
+      # Stand-ins for services that use the mirror. One exists from the first
+      # boot, and a switch adds the other once the mirror is ready.
+      systemd.services.consumer = consumer;
+      specialisation.lateconsumer.configuration.systemd.services.late-consumer = consumer;
 
       systemd.services.packets = {
         wantedBy = [ "multi-user.target" ];
@@ -58,6 +74,17 @@
             assert owner == "musicbrainz", f"{table}: {owner!r}"
         search_path = mb("SHOW search_path")
         assert search_path == "musicbrainz, public", search_path
+
+    with subtest("units that use the mirror start once the first import is done"):
+        machine.wait_for_unit("mbslave-ready.target")
+        machine.wait_for_unit("consumer.service")
+        imported = int(machine.succeed("systemctl show -P ExecMainExitTimestampMonotonic mbslave-init"))
+        started = int(machine.succeed("systemctl show -P ExecMainStartTimestampMonotonic consumer"))
+        assert started > imported, f"consumer started at {started}, import ended at {imported}"
+
+    with subtest("a switch starts units that a new configuration adds to the ready target"):
+        machine.succeed("/run/booted-system/specialisation/lateconsumer/bin/switch-to-configuration test")
+        machine.succeed("systemctl is-active late-consumer")
 
     with subtest("readers can read the mirror and nothing more"):
         machine.succeed(as_user("alice", "SELECT count(*) FROM musicbrainz.artist"))

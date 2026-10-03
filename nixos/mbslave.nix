@@ -345,6 +345,28 @@ in
       script = applyGrants;
     };
 
+    # The point from which the mirror is imported and readable. Units that use
+    # the mirror order on it rather than on mbslave-init, which reports success
+    # as soon as a first import starts:
+    #
+    #   wantedBy = [ "mbslave-ready.target" ];
+    #   after = [ "mbslave-ready.target" ];
+    systemd.targets.mbslave-ready = {
+      description = "MusicBrainz mirror imported and readable";
+      wants = [ "mbslave-grants.service" ];
+      after = [ "mbslave-grants.service" ];
+    };
+
+    # Reaches mbslave-ready.target at boot once the stamp exists, and on a new
+    # host when the first import writes it.
+    systemd.paths.mbslave-ready = {
+      wantedBy = [ "multi-user.target" ];
+      pathConfig = {
+        PathExists = stamp;
+        Unit = "mbslave-ready.target";
+      };
+    };
+
     systemd.services.mbslave-sync = mkIf (cfg.tokenFile != null) {
       description = "Apply MusicBrainz replication packets";
       requires = [ "postgresql.target" ];

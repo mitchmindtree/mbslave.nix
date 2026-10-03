@@ -4,7 +4,7 @@
   name = "mbslave";
 
   nodes.machine =
-    { pkgs, ... }:
+    { lib, pkgs, ... }:
     {
       imports = [ ../nixos/mbslave.nix ];
 
@@ -15,7 +15,15 @@
         importDumps = false;
         tokenFile = pkgs.writeText "metabrainz-token" "test-token";
         settings.musicbrainz.base_url = "http://127.0.0.1:8000/";
+        readers = [ "alice" ];
       };
+
+      # bob can log in to PostgreSQL but is not a reader.
+      users.users.alice.isNormalUser = true;
+      users.users.bob.isNormalUser = true;
+      services.postgresql.ensureUsers = [ { name = "bob"; } ];
+
+      specialisation.noreaders.configuration.services.mbslave.readers = lib.mkForce [ ];
 
       systemd.services.packets = {
         wantedBy = [ "multi-user.target" ];
@@ -26,6 +34,9 @@
   testScript = ''
     def mb(sql):
         return machine.succeed(f"sudo -u musicbrainz psql -d musicbrainz -tAc \"{sql}\"").strip()
+
+    def as_user(user, sql):
+        return f"sudo -u {user} psql -d musicbrainz -tAc \"{sql}\""
 
     machine.wait_for_unit("multi-user.target")
     machine.wait_for_file("/var/lib/mbslave/initialised", timeout=600)
@@ -47,6 +58,17 @@
             assert owner == "musicbrainz", f"{table}: {owner!r}"
         search_path = mb("SHOW search_path")
         assert search_path == "musicbrainz, public", search_path
+
+    with subtest("readers can read the mirror and nothing more"):
+        machine.succeed(as_user("alice", "SELECT count(*) FROM musicbrainz.artist"))
+        machine.succeed(as_user("alice", "SELECT count(*) FROM cover_art_archive.art_type"))
+        machine.fail(as_user("alice", "DELETE FROM musicbrainz.artist"))
+        machine.fail(as_user("alice", "SELECT count(*) FROM dbmirror2.pending_data"))
+        machine.fail(as_user("bob", "SELECT count(*) FROM musicbrainz.artist"))
+
+    with subtest("readers can read tables that the mirror role adds later"):
+        mb("CREATE TABLE musicbrainz.added_later (id int)")
+        machine.succeed(as_user("alice", "SELECT count(*) FROM musicbrainz.added_later"))
 
     with subtest("only peer auth with the mbslave map admits other users"):
         machine.fail("sudo -u nobody psql -U musicbrainz -d musicbrainz -c 'SELECT 1'")
@@ -77,6 +99,12 @@
         machine.succeed("systemctl start mbslave-init")
         machine.wait_for_file("/var/lib/mbslave/initialised", timeout=600)
         assert mb("SELECT count(*) FROM musicbrainz.replication_control") == "0"
+        machine.succeed(as_user("alice", "SELECT count(*) FROM musicbrainz.artist"))
+
+    with subtest("removing a reader revokes its access"):
+        machine.succeed("/run/booted-system/specialisation/noreaders/bin/switch-to-configuration test")
+        machine.succeed("systemctl is-active mbslave-grants")
+        machine.fail(as_user("alice", "SELECT count(*) FROM musicbrainz.artist"))
 
     with subtest("init refuses a database that it did not create"):
         machine.succeed("rm /var/lib/mbslave/initialised")

@@ -27,6 +27,52 @@ let
   marker = "${cfg.stateDir}/importing";
   dumps = "${cfg.stateDir}/dumps";
 
+  readerRole = "${cfg.user}_reader";
+  quotedReaders = lib.concatMapStringsSep ", " (r: "'${r}'") cfg.readers;
+
+  # Idempotent, so both the import and every start of mbslave-grants apply it.
+  # The default privileges extend the grant to tables that schema upgrades add.
+  # dbmirror2 holds only the replication queue.
+  grantsSql = pkgs.writeText "mbslave-grants.sql" ''
+    DO $$
+    BEGIN
+      IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${readerRole}') THEN
+        CREATE ROLE ${readerRole} NOLOGIN;
+      END IF;
+    END
+    $$;
+
+    DO $$
+    DECLARE
+      s name;
+      r name;
+    BEGIN
+      FOR s IN
+        SELECT nspname FROM pg_namespace
+        WHERE nspowner = '${cfg.user}'::regrole AND nspname <> 'dbmirror2'
+      LOOP
+        EXECUTE format('GRANT USAGE ON SCHEMA %I TO ${readerRole}', s);
+        EXECUTE format('GRANT SELECT ON ALL TABLES IN SCHEMA %I TO ${readerRole}', s);
+        EXECUTE format(
+          'ALTER DEFAULT PRIVILEGES FOR ROLE ${cfg.user} IN SCHEMA %I GRANT SELECT ON TABLES TO ${readerRole}',
+          s
+        );
+      END LOOP;
+
+      FOR r IN
+        SELECT m.rolname FROM pg_auth_members a JOIN pg_roles m ON m.oid = a.member
+        WHERE a.roleid = '${readerRole}'::regrole
+          AND m.rolname <> ALL (ARRAY[${quotedReaders}]::name[])
+      LOOP
+        EXECUTE format('REVOKE ${readerRole} FROM %I', r);
+      END LOOP;
+    END
+    $$;
+
+    ${lib.concatMapStrings (r: "GRANT ${readerRole} TO ${r};\n") cfg.readers}
+  '';
+  applyGrants = "psql -v ON_ERROR_STOP=1 -d ${cfg.database} -f ${grantsSql}";
+
   environment = {
     MBSLAVE_CONFIG = configFile;
     # Progress bars are noise in the journal. mbslave still logs each table.
@@ -145,6 +191,18 @@ in
       description = "Tables that mbslave neither imports nor replicates.";
     };
 
+    readers = mkOption {
+      type = types.listOf identifier;
+      default = [ ];
+      example = [ "alice" ];
+      description = ''
+        PostgreSQL roles that may read the mirror, through membership of the
+        `<user>_reader` role. The module creates each role if it is missing.
+        The default peer authentication lets the system user of the same name
+        connect as it. Removing a name revokes its access but keeps the role.
+      '';
+    };
+
     settings = mkOption {
       type = settingsFormat.type;
       default = { };
@@ -172,7 +230,7 @@ in
 
     services.postgresql = {
       enable = true;
-      ensureUsers = [ { name = cfg.user; } ];
+      ensureUsers = map (name: { inherit name; }) ([ cfg.user ] ++ cfg.readers);
       # mbslave-init runs as the superuser but creates the tables as the mirror
       # role, so the superuser may also connect as that role.
       identMap = ''
@@ -245,9 +303,28 @@ in
         psql -c "ALTER ROLE ${cfg.user} IN DATABASE ${cfg.database} SET search_path TO ${
           cfg.settings.schemas.musicbrainz or "musicbrainz"
         }, public"
+        ${applyGrants}
 
         mv ${escapeShellArg marker} ${escapeShellArg stamp}
       '';
+    };
+
+    # Applies reader changes on boot and switch. mbslave-init applies them to a
+    # fresh import itself.
+    systemd.services.mbslave-grants = {
+      description = "Grant read access to the MusicBrainz mirror";
+      wantedBy = [ "multi-user.target" ];
+      requires = [ "postgresql.target" ];
+      after = [ "postgresql.target" ];
+      unitConfig.ConditionPathExists = stamp;
+      path = [ pg.package ];
+      serviceConfig = hardening // {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        User = pg.superUser;
+        Group = pg.superUser;
+      };
+      script = applyGrants;
     };
 
     systemd.services.mbslave-sync = mkIf (cfg.tokenFile != null) {

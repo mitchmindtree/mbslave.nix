@@ -37,7 +37,10 @@ python3Packages.buildPythonApplication rec {
 
   # `mbslave init` shells out to `mbslave psql`, which runs `psql`.
   makeWrapperArgs = [
-    "--prefix PATH : ${lib.makeBinPath [ postgresql ]}"
+    "--prefix"
+    "PATH"
+    ":"
+    (lib.makeBinPath [ postgresql ])
   ];
 
   nativeCheckInputs = [ python3Packages.pytestCheckHook ];
